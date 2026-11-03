@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# tj (tmux jump): pick a directory -> land in a tmux session named after it.
+#
+#   Works the same inside tmux (C-a j, popup) and in a plain shell (tj).
+#   Enter on a directory opens a session named after it, or switches to it
+#   if it already exists.
+#
+#   Keys in the picker, once it is open (C-a j in tmux, tj in a shell);
+#   press them directly, without the tmux prefix, e.g. C-a j C-z:
+#     Enter    open a session for the highlighted directory
+#     Right    go into the directory (list its subdirectories); Tab works too
+#     Left     go one level up
+#     C-p      projects (~/Projects/Code), the start view
+#     C-g      the whole filesystem, starting at /
+#     C-z      zoxide: directories you pick most often and most recently
+#     C-f      search everywhere: every directory on the system, shallow ones first
+#     Esc      cancel
+#
+#   Requires: tmux, fzf (>= 0.60, for --accept-nth), fd, awk; zoxide is optional.
+
+set -u
+
+ROOT="${TJ_ROOT:-$HOME/Projects/Code}"   # where projects live (override with TJ_ROOT)
+SELF="$(readlink -f "$0")"               # absolute path to this script; fzf calls it again
+
+# State file: remembers the current mode and directory (needed for Left/Right).
+# fzf runs this script as separate processes, so the state has to live in a file.
+STATE="${TJ_STATE:-${TMPDIR:-/tmp}/tj-state.$$}"
+export TJ_STATE="$STATE"
+
+# Filesystem-wide search skips the kernel's virtual filesystems at the top level
+# (a leading "/" anchors the pattern to the search root) and, anywhere,
+# .git and node_modules.
+FD_SEARCH=(--type d --hidden
+	--exclude /proc --exclude /sys --exclude /dev --exclude /run
+	--exclude .git --exclude node_modules)
+
+# ---------- helpers ----------
+
+pretty() { sed "s#^$HOME#~#"; }   # $HOME/x -> ~/x (display only)
+
+# Directories that already have a tmux session (used for the ● marker).
+session_paths() { tmux list-sessions -F '#{session_path}' 2>/dev/null; }
+
+# Turn a stream of paths into fzf lines: "<full path><TAB><what you see>".
+# fzf shows only field 2 (--with-nth=2) and returns field 1 on Enter (--accept-nth=1).
+# A single awk process formats the whole stream; spawning a process per line
+# (grep, sed) is what made a system-wide search take seconds.
+#   $1 = "name": show just the last path component ("apt/")
+#   $1 = "path": show the full path with ~ for $HOME
+#   $1 = "self": show "./" (the directory you are in; its path is in the prompt)
+format() {
+	TJ_OPEN="$(session_paths)" awk -v mode="$1" -v home="$HOME" '
+		BEGIN { n = split(ENVIRON["TJ_OPEN"], o, "\n"); for (i = 1; i <= n; i++) open[o[i]] = 1 }
+		{
+			p = $0; sub(/\/$/, "", p); if (p == "") p = "/"
+			if (mode == "self") label = "./"
+			else if (mode == "name") { label = p; sub(/.*\//, "", label); label = label "/" }
+			else { label = p; if (index(label, home) == 1) label = "~" substr(label, length(home) + 1) }
+			printf "%s\t%s%s\n", p, ((p in open) ? "● " : "  "), label
+			fflush()
+		}'
+}
+
+# ---------- lists for each mode ----------
+
+# Breadth-first search: depth 1 first, then 2, then 3... so shallow directories
+# such as /var/log show up immediately instead of after a full scan.
+# Stops at the first depth with no results.
+search_breadth_first() {
+	local depth=1 out
+	while :; do
+		out="$(fd --exact-depth "$depth" "${FD_SEARCH[@]}" . / 2>/dev/null)"
+		[ -z "$out" ] && break
+		printf '%s\n' "$out"
+		depth=$((depth + 1))
+	done
+}
+
+list() {
+	local mode base
+	IFS=$'\t' read -r mode base <"$STATE"
+	case "$mode" in
+	browse)   # one directory's subdirectories; the first entry "./" is the directory itself
+		printf '%s\n' "$base" | format self
+		fd --max-depth 1 --type d --hidden --exclude .git . "$base" 2>/dev/null | sort | format name ;;
+	zoxide)   # directories ranked by how often and how recently you picked them
+		zoxide query --list 2>/dev/null | format path ;;
+	search)   # every directory on the system, shallow ones first
+		search_breadth_first | format path ;;
+	esac
+}
+
+# Switch mode/directory and tell fzf what to do (the transform action reads this output).
+goto() {
+	local mode="$1" base="${2:-}" prompt
+	printf '%s\t%s\n' "$mode" "$base" >"$STATE"
+	case "$mode" in
+	browse) prompt="$(pretty <<<"${base%/}")/ > " ;;
+	zoxide) prompt="zoxide > " ;;
+	search) prompt="everywhere > " ;;
+	esac
+	printf 'reload(%q _list)+change-prompt(%s)+clear-query+first' "$SELF" "$prompt"
+}
+
+# Right: go into the highlighted directory. Left: one level up.
+nav() {
+	local dir="$1" mode base
+	IFS=$'\t' read -r mode base <"$STATE"
+	case "$2" in
+	in) goto browse "$dir" ;;
+	up) if [ "$mode" = browse ]; then goto browse "$(dirname "$base")"
+	    else goto browse "$(dirname "$dir")"; fi ;;
+	esac
+}
+
+# ---------- session name and switching ----------
+
+clean() { local n="${1//[.:]/_}"; printf '%s' "${n:-root}"; }   # "." and ":" break tmux targets
+
+session_name() {
+	local dir="$1" name path
+	name="$(clean "$(basename "$dir")")"
+	[ "$dir" = "/" ] && name=root
+	# Name already taken by a session for a DIFFERENT directory? Prefix the parent: /var/log -> var_log
+	if tmux has-session -t "=$name" 2>/dev/null; then
+		path="$(tmux display-message -p -t "=$name:" '#{session_path}')"
+		[ "$path" != "$dir" ] && name="$(clean "$(basename "$(dirname "$dir")")")_$name"
+	fi
+	printf '%s' "$name"
+}
+
+open_session() {
+	local dir="$1" name
+	name="$(session_name "$dir")"
+	command -v zoxide >/dev/null && zoxide add "$dir"      # zoxide learns from your picks
+	if [ -n "${TMUX:-}" ]; then                            # inside tmux (e.g. in the popup)
+		tmux has-session -t "=$name" 2>/dev/null || tmux new-session -d -s "$name" -c "$dir"
+		tmux switch-client -t "=$name"
+	else                                                   # plain terminal
+		rm -f "$STATE"                                     # exec never returns, so clean up now
+		exec tmux new-session -A -s "$name" -c "$dir"
+	fi
+}
+
+# ---------- internal entry points (called by fzf) ----------
+
+case "${1:-}" in
+_list) list; exit ;;
+_goto) shift; goto "$@"; exit ;;
+_nav)  nav "$2" "$3"; exit ;;
+esac
+
+# ---------- main ----------
+
+trap 'rm -f "$STATE"' EXIT
+printf 'browse\t%s\n' "$ROOT" >"$STATE"
+q="$(printf '%q' "$SELF")"
+
+dir="$(
+	list | fzf \
+		--delimiter=$'\t' --with-nth=2 --accept-nth=1 \
+		--layout=reverse --height=100% \
+		--prompt="$(pretty <<<"$ROOT")/ > " \
+		--header='Enter session · → in · ← up · C-p projects · C-g / · C-z zoxide · C-f everywhere' \
+		--preview='ls -1 --color=always {1} 2>/dev/null | head -100' \
+		--preview-window='right,40%' \
+		--bind="right,tab:transform($q _nav {1} in)" \
+		--bind="left:transform($q _nav {1} up)" \
+		--bind="ctrl-p:transform($q _goto browse $(printf '%q' "$ROOT"))" \
+		--bind="ctrl-g:transform($q _goto browse /)" \
+		--bind="ctrl-z:transform($q _goto zoxide)" \
+		--bind="ctrl-f:transform($q _goto search)"
+)" || exit 0                                               # Esc: do nothing
+
+[ -n "$dir" ] && open_session "$dir"

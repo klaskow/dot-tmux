@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# tmux-keys-diff: compare your key bindings with tmux's built-in defaults.
+#
+#   Starts two throwaway tmux servers on private sockets (never touches your
+#   running server): one with no config (-f /dev/null) and one with your config,
+#   then prints which keys you OVERRIDE, which you ADD and which you REMOVE.
+#
+#   Usage:  tmux-keys-diff [config]      (default: ~/.tmux.conf)
+#           tmux-keys-diff ~/.tmux.conf | less
+#   Is a key free?  tmux-keys-diff | grep -w KEY   (no output: you did not touch it)
+
+set -euo pipefail
+config="${1:-$HOME/.tmux.conf}"
+[ -r "$config" ] || { echo "tmux-keys-diff: cannot read $config" >&2; exit 1; }
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+# list-keys output -> "table key<TAB>command", one binding per line, sorted.
+dump() {
+	tmux -L "tkd-$$-$1" -f "$2" new-session -d \; list-keys \; kill-server |
+		awk '{ for (i = 1; i <= NF; i++) if ($i == "-T") {
+			cmd = ""; for (j = i + 3; j <= NF; j++) cmd = cmd " " $j
+			print $(i + 1) " " $(i + 2) "\t" substr(cmd, 2); break } }' |
+		LC_ALL=C sort -t $'\t' -k1,1
+}
+
+dump default /dev/null >"$tmp/default"
+dump mine "$config" >"$tmp/mine"
+
+echo "== OVERRIDDEN (default key, different command)"
+LC_ALL=C join -t $'\t' "$tmp/default" "$tmp/mine" |
+	awk -F'\t' '$2 != $3 { printf "  %s\n      default: %s\n      yours:   %s\n", $1, $2, $3 }'
+
+echo "== ADDED (keys that were free)"
+LC_ALL=C join -t $'\t' -v 2 "$tmp/default" "$tmp/mine" | awk -F'\t' '{ printf "  %-24s %s\n", $1, $2 }'
+
+echo "== REMOVED (default keys you unbound)"
+LC_ALL=C join -t $'\t' -v 1 "$tmp/default" "$tmp/mine" | awk -F'\t' '{ printf "  %-24s %s\n", $1, $2 }'
